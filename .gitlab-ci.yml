@@ -1,0 +1,166 @@
+#Define a Default Image which would be used for all the stages
+default:
+  image: jfgarcia268/sfdx_vlocity_java:latest
+#
+# Define the stages of our pipeline
+#
+stages:
+    - createpackageversion
+    - deploy
+    - promote_deploy
+    - vlocity_deploy
+
+variables:          
+          KEY: "test123"
+
+package_version:
+    stage: createpackageversion
+    variables:          
+          RUN_APEX_TESTS: "false"
+          SKIP_VALIDATION: "false"
+    artifacts:
+        paths:
+            - PACKAGE_VERSION_ID.TXT
+    when: manual
+    script:
+        # Login
+        - echo ${SFDX_URL_DEVHUB} > env.sfdx
+        - sfdx force:auth:sfdxurl:store -d -a DEVHUB -f env.sfdx
+        - rm -rf env.sfdx
+        # Increment package version number
+        - echo $PACKAGE_NAME
+        - sfdx force:org:list --skipconnectionstatus
+        - PACKAGE_VERSION_JSON="$(sfdx force:package:version:list -v DEVHUB --verbose  --packages $PACKAGE_NAME  --json |  jq '.result | sort_by(-.MajorVersion, -.MinorVersion, -.PatchVersion, -.BuildNumber) | .[0]')"
+        - IS_RELEASED=$(jq -r '.IsReleased' <<< $PACKAGE_VERSION_JSON)
+        - MAJOR_VERSION=$(jq -r '.MajorVersion' <<< $PACKAGE_VERSION_JSON)
+        - MINOR_VERSION=$(jq -r '.MinorVersion' <<< $PACKAGE_VERSION_JSON)
+        - PATCH_VERSION=$(jq -r '.PatchVersion' <<< $PACKAGE_VERSION_JSON)
+        - LAST_BUILD_VERSION=$(jq -r '.BuildNumber' <<< $PACKAGE_VERSION_JSON)
+        - BUILD_VERSION="NEXT"
+        - if [ -z $MAJOR_VERSION ]; then MAJOR_VERSION=1; fi;
+        - if [ -z $MINOR_VERSION ]; then MINOR_VERSION=0; fi;
+        - if [ -z $PATCH_VERSION ]; then PATCH_VERSION=0; fi;
+        - if [ "$IS_RELEASED" == "true" ]; then MINOR_VERSION=$(($MINOR_VERSION+1)); LAST_BUILD_VERSION=-1; fi;
+        - VERSION_NUMBER="$MAJOR_VERSION.$MINOR_VERSION.$PATCH_VERSION.$BUILD_VERSION"
+        - echo $VERSION_NUMBER
+        - COMMAND="sfdx force:package:version:create --package $PACKAGE_NAME --versionnumber $VERSION_NUMBER --installationkey ${KEY} --wait 10 --json"
+        # Create packaged version
+        - if [ $RUN_APEX_TESTS == 'true' ]; then
+        -    echo "Adding Code Coverage" 
+        -    COMMAND="${COMMAND} --codecoverage " 
+        - fi
+        - if [ $SKIP_VALIDATION == 'true' ]; then
+        -     echo "Adding Skip Validation" 
+        -    COMMAND="${COMMAND} --skipvalidation " 
+        - fi
+        - $(echo $COMMAND) | jq -r '.result.SubscriberPackageVersionId' > PACKAGE_VERSION_ID.TXT
+        - export PACKAGE_VERSION_ID=`cat PACKAGE_VERSION_ID.TXT`
+        - echo  $PACKAGE_VERSION_ID
+        - LATEST_BUILD_VERSION=$(($LAST_BUILD_VERSION+1))
+        - LATEST_PACKAGE_VERSION="$MAJOR_VERSION.$MINOR_VERSION.$PATCH_VERSION.$LATEST_BUILD_VERSION"
+        - echo "For $PACKAGE_NAME, $LATEST_PACKAGE_VERSION version has been created"
+    allow_failure: false
+
+create_scratch_deploy:
+    stage: deploy
+    when: manual
+    script:
+        # Login
+        - echo ${SFDX_URL_DEVHUB} > env.sfdx
+        - sfdx force:auth:sfdxurl:store -d -a DEVHUB -f env.sfdx
+        - rm -rf env.sfdx
+        # Create scratch org
+        - sfdx force:org:create --setdefaultusername --definitionfile config/project-scratch-def.json --wait 10 --durationdays 7 -u DEVHUB
+        # Read the package version id from file created in prior stage
+        - export PACKAGE_VERSION_ID=`cat ./PACKAGE_VERSION_ID.TXT`
+        - echo $PACKAGE_VERSION_ID
+        - sfdx force:package:install --package $PACKAGE_VERSION_ID --wait 10 --publishwait 10 --installationkey ${KEY} --noprompt
+        - sfdx force:user:permset:assign --permsetname HandsetBuy || true
+        # Add sample data into app
+        - sfdx force:data:tree:import --plan data/sample-data-plan.json || true
+        # Install vlocity Manage Package
+        - PACKAGE_ID=$(jq -r '.packageAliases."Vlocity CMT"' sfdx-project.json)
+        - sfdx force:package:install -p ${PACKAGE_ID} -w 1000 --noprompt
+        # Vlocity Setup 
+        - vlocity  --nojob packUpdateSettings --simpleLogging true
+        - vlocity  --nojob installVlocityInitial --verbose
+        - vlocity --nojob runApex -apex apex/cmt_InitializeOrg.cls --simpleLogging true
+        # Vlocity Deploy
+        - vlocity  -job Deploy_Delta.yaml packDeploy --verbose true --simpleLogging true
+        - vlocity --nojob runApex -apex apex/RunProductBatchJobs.cls --simpleLogging true
+        # Get the username for the scratch org
+        - export SCRATCH_ORG_USERNAME="$(sfdx force:user:display --json | jq -r '.result.username')"
+        # Generate a new password for the scrach org
+        - sfdx force:user:password:generate
+        - echo -e "\n\n\n\n"
+        # Display username, password, and instance URL for login
+        - sfdx force:user:display
+    needs:
+        - job:  package_version
+          artifacts: true
+    
+
+App_deploy:
+    stage: deploy
+    when: manual
+    script:
+        #Login
+        - echo ${!SFDX_URL} > env.sfdx
+        - sfdx force:auth:sfdxurl:store -s -a app_deploy -f env.sfdx
+        - rm -rf env.sfdx
+        - export PACKAGE_VERSION_ID=`cat ./PACKAGE_VERSION_ID.TXT`
+        - echo $PACKAGE_VERSION_ID
+        # Install the package version
+        - sfdx force:package:install --package $PACKAGE_VERSION_ID --wait 100 --publishwait 100  --installationkey $KEY  --noprompt
+        # Assign the permission set
+        - sfdx force:user:permset:assign --permsetname HandsetBuy || true
+        # Add sample data into app
+        - sfdx force:data:tree:import --plan data/sample-data-plan.json
+        # Vlocity Delta Deploy
+        - vlocity -sfdx.username app_deploy -job Deploy_Delta.yaml packDeploy --verbose true --simpleLogging true
+    needs:
+        - job:  package_version
+          artifacts: true
+
+
+SF-app-promote:
+    stage: promote_deploy
+    when: manual
+#    only:
+#      variables:
+#           - '$promote == "true"'
+    script:
+        # Login
+        - echo ${SFDX_URL_PROD} > env.sfdx
+        - sfdx force:auth:sfdxurl:store -s -a PROD -f env.sfdx
+        - rm -rf env.sfdx
+        # Read the package version id from file created in prior stage
+        - export PACKAGE_VERSION_ID=`cat ./PACKAGE_VERSION_ID.TXT`
+        - echo $PACKAGE_VERSION_ID
+        # Promote the package version
+        - sfdx force:package:version:promote --package $PACKAGE_VERSION_ID --noprompt --targetdevhubusername PROD
+        # Install the package version
+        - sfdx force:package:install --package $PACKAGE_VERSION_ID --wait 100 --publishwait 100 --noprompt --installationkey ${KEY} 
+        - sfdx force:user:permset:assign --permsetname HandsetBuy || true
+    needs:
+        - job:  package_version
+          artifacts: true
+    allow_failure: false
+
+Vlocity-deploy:
+    stage: vlocity_deploy
+    when: manual
+#    only:
+#      variables:
+#           - '$promote == "true"'
+    script:
+        # Login
+        - echo ${SFDX_URL_PROD} > env.sfdx
+        - sfdx force:auth:sfdxurl:store -s -a PROD -f env.sfdx
+        - rm -rf env.sfdx
+        # Deploy Vlocity Delta
+        - vlocity -sfdx.username PROD -job Deploy_Delta.yaml packDeploy --verbose true --simpleLogging true
+    artifacts:
+      paths:
+        - vlocity-temp/logs
+    allow_failure: false

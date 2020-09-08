@@ -1,0 +1,10 @@
+build_*.properties
+dataPacksJobs/
+coverage/
+vlocity-temp/
+.vscode/
+.sfdx/
+.npmrc
+.vlocity*
+VlocityBuildLog.yaml
+VlocityBuildErrors.log
